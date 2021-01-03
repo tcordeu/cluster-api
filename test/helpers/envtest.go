@@ -298,6 +298,10 @@ func (t *TestEnvironment) CreateKubeconfigSecret(ctx context.Context, cluster *c
 	return kubeconfig.CreateEnvTestSecret(ctx, t.Client, t.Config, cluster)
 }
 
+func (t *TestEnvironment) Create(ctx context.Context, obj client.Object, opts ...client.CreateOption) error {
+	return t.Client.Create(ctx, obj, opts...)
+}
+
 func (t *TestEnvironment) Cleanup(ctx context.Context, objs ...client.Object) error {
 	errs := []error{}
 	for _, o := range objs {
