@@ -157,12 +157,25 @@ func SelfHostedSpec(ctx context.Context, inputGetter func() SelfHostedSpecInput)
 			Name:      cluster.Name,
 		}, input.E2EConfig.GetIntervals(specName, "wait-cluster")...)
 
-		controlPlane := framework.GetKubeadmControlPlaneByCluster(ctx, framework.GetKubeadmControlPlaneByClusterInput{
+		selfHostedControlPlane := framework.GetKubeadmControlPlaneByCluster(ctx, framework.GetKubeadmControlPlaneByClusterInput{
 			Lister:      selfHostedClusterProxy.GetClient(),
 			ClusterName: selfHostedCluster.Name,
 			Namespace:   selfHostedCluster.Namespace,
 		})
-		Expect(controlPlane).ToNot(BeNil())
+		Expect(selfHostedControlPlane).ToNot(BeNil())
+
+		By("Upgrading the self hosted control-plane")
+		framework.UpgradeControlPlaneAndWaitForUpgrade(ctx, framework.UpgradeControlPlaneAndWaitForUpgradeInput{
+			ClusterProxy:                selfHostedClusterProxy,
+			Cluster:                     selfHostedCluster,
+			ControlPlane:                selfHostedControlPlane,
+			EtcdImageTag:                input.E2EConfig.GetVariable(EtcdVersionUpgradeTo),
+			DNSImageTag:                 input.E2EConfig.GetVariable(CoreDNSVersionUpgradeTo),
+			KubernetesUpgradeVersion:    input.E2EConfig.GetVariable(KubernetesVersionUpgradeTo),
+			WaitForMachinesToBeUpgraded: input.E2EConfig.GetIntervals(specName, "wait-machine-upgrade"),
+			WaitForDNSUpgrade:           input.E2EConfig.GetIntervals(specName, "wait-machine-upgrade"),
+			WaitForEtcdUpgrade:          input.E2EConfig.GetIntervals(specName, "wait-machine-upgrade"),
+		})
 
 		By("PASSED!")
 	})
