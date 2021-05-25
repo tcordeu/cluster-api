@@ -60,6 +60,112 @@ func SelfHostedSpec(ctx context.Context, inputGetter func() SelfHostedSpecInput)
 		selfHostedCluster       *clusterv1.Cluster
 	)
 
+	runPivotTest := func(controlPlaneMachineCount int64) {
+		By("Creating a workload cluster")
+
+		clusterctl.ApplyClusterTemplateAndWait(ctx, clusterctl.ApplyClusterTemplateAndWaitInput{
+			ClusterProxy: input.BootstrapClusterProxy,
+			ConfigCluster: clusterctl.ConfigClusterInput{
+				LogFolder:                filepath.Join(input.ArtifactFolder, "clusters", input.BootstrapClusterProxy.GetName()),
+				ClusterctlConfigPath:     input.ClusterctlConfigPath,
+				KubeconfigPath:           input.BootstrapClusterProxy.GetKubeconfigPath(),
+				InfrastructureProvider:   clusterctl.DefaultInfrastructureProvider,
+				Flavor:                   clusterctl.DefaultFlavor,
+				Namespace:                namespace.Name,
+				ClusterName:              fmt.Sprintf("%s-%s", specName, util.RandomString(6)),
+				KubernetesVersion:        input.E2EConfig.GetVariable(KubernetesVersion),
+				ControlPlaneMachineCount: pointer.Int64Ptr(controlPlaneMachineCount),
+				WorkerMachineCount:       pointer.Int64Ptr(1),
+			},
+			WaitForClusterIntervals:      input.E2EConfig.GetIntervals(specName, "wait-cluster"),
+			WaitForControlPlaneIntervals: input.E2EConfig.GetIntervals(specName, "wait-control-plane"),
+			WaitForMachineDeployments:    input.E2EConfig.GetIntervals(specName, "wait-worker-nodes"),
+		}, clusterResources)
+
+		By("Turning the workload cluster into a management cluster")
+
+		// In case of the cluster id a DockerCluster, we should load controller images into the nodes.
+		// Nb. this can be achieved also by changing the DockerMachine spec, but for the time being we are using
+		// this approach because this allows to have a single source of truth for images, the e2e config
+		cluster := clusterResources.Cluster
+		if cluster.Spec.InfrastructureRef.Kind == "DockerCluster" {
+			Expect(bootstrap.LoadImagesToKindCluster(ctx, bootstrap.LoadImagesToKindClusterInput{
+				Name:   cluster.Name,
+				Images: input.E2EConfig.Images,
+			})).To(Succeed())
+		}
+
+		// Get a ClusterBroker so we can interact with the workload cluster
+		selfHostedClusterProxy = input.BootstrapClusterProxy.GetWorkloadCluster(ctx, cluster.Namespace, cluster.Name)
+
+		Byf("Creating a namespace for hosting the %s test spec", specName)
+		selfHostedNamespace, selfHostedCancelWatches = framework.CreateNamespaceAndWatchEvents(ctx, framework.CreateNamespaceAndWatchEventsInput{
+			Creator:   selfHostedClusterProxy.GetClient(),
+			ClientSet: selfHostedClusterProxy.GetClientSet(),
+			Name:      namespace.Name,
+			LogFolder: filepath.Join(input.ArtifactFolder, "clusters", "bootstrap"),
+		})
+
+		By("Initializing the workload cluster")
+		clusterctl.InitManagementClusterAndWatchControllerLogs(ctx, clusterctl.InitManagementClusterAndWatchControllerLogsInput{
+			ClusterProxy:            selfHostedClusterProxy,
+			ClusterctlConfigPath:    input.ClusterctlConfigPath,
+			InfrastructureProviders: input.E2EConfig.InfrastructureProviders(),
+			LogFolder:               filepath.Join(input.ArtifactFolder, "clusters", cluster.Name),
+		}, input.E2EConfig.GetIntervals(specName, "wait-controllers")...)
+
+		By("Ensure API servers are stable before doing move")
+		// Nb. This check was introduced to prevent doing move to self-hosted in an aggressive way and thus avoid flakes.
+		// More specifically, we were observing the test failing to get objects from the API server during move, so we
+		// are now testing the API servers are stable before starting move.
+		Consistently(func() error {
+			kubeSystem := &corev1.Namespace{}
+			return input.BootstrapClusterProxy.GetClient().Get(ctx, client.ObjectKey{Name: "kube-system"}, kubeSystem)
+		}, "5s", "100ms").Should(BeNil(), "Failed to assert bootstrap API server stability")
+		Consistently(func() error {
+			kubeSystem := &corev1.Namespace{}
+			return selfHostedClusterProxy.GetClient().Get(ctx, client.ObjectKey{Name: "kube-system"}, kubeSystem)
+		}, "5s", "100ms").Should(BeNil(), "Failed to assert self-hosted API server stability")
+
+		By("Moving the cluster to self hosted")
+		clusterctl.Move(ctx, clusterctl.MoveInput{
+			LogFolder:            filepath.Join(input.ArtifactFolder, "clusters", "bootstrap"),
+			ClusterctlConfigPath: input.ClusterctlConfigPath,
+			FromKubeconfigPath:   input.BootstrapClusterProxy.GetKubeconfigPath(),
+			ToKubeconfigPath:     selfHostedClusterProxy.GetKubeconfigPath(),
+			Namespace:            namespace.Name,
+		})
+
+		log.Logf("Waiting for the cluster to be reconciled after moving to self hosted")
+		selfHostedCluster = framework.DiscoveryAndWaitForCluster(ctx, framework.DiscoveryAndWaitForClusterInput{
+			Getter:    selfHostedClusterProxy.GetClient(),
+			Namespace: selfHostedNamespace.Name,
+			Name:      cluster.Name,
+		}, input.E2EConfig.GetIntervals(specName, "wait-cluster")...)
+
+		selfHostedControlPlane := framework.GetKubeadmControlPlaneByCluster(ctx, framework.GetKubeadmControlPlaneByClusterInput{
+			Lister:      selfHostedClusterProxy.GetClient(),
+			ClusterName: selfHostedCluster.Name,
+			Namespace:   selfHostedCluster.Namespace,
+		})
+		Expect(selfHostedControlPlane).ToNot(BeNil())
+
+		By("Upgrading the self hosted control-plane")
+		framework.UpgradeControlPlaneAndWaitForUpgrade(ctx, framework.UpgradeControlPlaneAndWaitForUpgradeInput{
+			ClusterProxy:                selfHostedClusterProxy,
+			Cluster:                     selfHostedCluster,
+			ControlPlane:                selfHostedControlPlane,
+			EtcdImageTag:                input.E2EConfig.GetVariable(EtcdVersionUpgradeTo),
+			DNSImageTag:                 input.E2EConfig.GetVariable(CoreDNSVersionUpgradeTo),
+			KubernetesUpgradeVersion:    input.E2EConfig.GetVariable(KubernetesVersionUpgradeTo),
+			WaitForMachinesToBeUpgraded: input.E2EConfig.GetIntervals(specName, "wait-machine-upgrade"),
+			WaitForDNSUpgrade:           input.E2EConfig.GetIntervals(specName, "wait-machine-upgrade"),
+			WaitForEtcdUpgrade:          input.E2EConfig.GetIntervals(specName, "wait-machine-upgrade"),
+		})
+
+		By("PASSED!")
+	}
+
 	BeforeEach(func() {
 		Expect(ctx).NotTo(BeNil(), "ctx is required for %s spec", specName)
 		input = inputGetter()
@@ -75,215 +181,13 @@ func SelfHostedSpec(ctx context.Context, inputGetter func() SelfHostedSpecInput)
 	})
 
 	It("Should pivot the bootstrap cluster to a self-hosted cluster", func() {
-		By("Creating a workload cluster")
-
-		clusterctl.ApplyClusterTemplateAndWait(ctx, clusterctl.ApplyClusterTemplateAndWaitInput{
-			ClusterProxy: input.BootstrapClusterProxy,
-			ConfigCluster: clusterctl.ConfigClusterInput{
-				LogFolder:                filepath.Join(input.ArtifactFolder, "clusters", input.BootstrapClusterProxy.GetName()),
-				ClusterctlConfigPath:     input.ClusterctlConfigPath,
-				KubeconfigPath:           input.BootstrapClusterProxy.GetKubeconfigPath(),
-				InfrastructureProvider:   clusterctl.DefaultInfrastructureProvider,
-				Flavor:                   clusterctl.DefaultFlavor,
-				Namespace:                namespace.Name,
-				ClusterName:              fmt.Sprintf("%s-%s", specName, util.RandomString(6)),
-				KubernetesVersion:        input.E2EConfig.GetVariable(KubernetesVersion),
-				ControlPlaneMachineCount: pointer.Int64Ptr(1),
-				WorkerMachineCount:       pointer.Int64Ptr(1),
-			},
-			WaitForClusterIntervals:      input.E2EConfig.GetIntervals(specName, "wait-cluster"),
-			WaitForControlPlaneIntervals: input.E2EConfig.GetIntervals(specName, "wait-control-plane"),
-			WaitForMachineDeployments:    input.E2EConfig.GetIntervals(specName, "wait-worker-nodes"),
-		}, clusterResources)
-
-		By("Turning the workload cluster into a management cluster")
-
-		// In case of the cluster id a DockerCluster, we should load controller images into the nodes.
-		// Nb. this can be achieved also by changing the DockerMachine spec, but for the time being we are using
-		// this approach because this allows to have a single source of truth for images, the e2e config
-		cluster := clusterResources.Cluster
-		if cluster.Spec.InfrastructureRef.Kind == "DockerCluster" {
-			Expect(bootstrap.LoadImagesToKindCluster(ctx, bootstrap.LoadImagesToKindClusterInput{
-				Name:   cluster.Name,
-				Images: input.E2EConfig.Images,
-			})).To(Succeed())
-		}
-
-		// Get a ClusterBroker so we can interact with the workload cluster
-		selfHostedClusterProxy = input.BootstrapClusterProxy.GetWorkloadCluster(ctx, cluster.Namespace, cluster.Name)
-
-		Byf("Creating a namespace for hosting the %s test spec", specName)
-		selfHostedNamespace, selfHostedCancelWatches = framework.CreateNamespaceAndWatchEvents(ctx, framework.CreateNamespaceAndWatchEventsInput{
-			Creator:   selfHostedClusterProxy.GetClient(),
-			ClientSet: selfHostedClusterProxy.GetClientSet(),
-			Name:      namespace.Name,
-			LogFolder: filepath.Join(input.ArtifactFolder, "clusters", "bootstrap"),
-		})
-
-		By("Initializing the workload cluster")
-		clusterctl.InitManagementClusterAndWatchControllerLogs(ctx, clusterctl.InitManagementClusterAndWatchControllerLogsInput{
-			ClusterProxy:            selfHostedClusterProxy,
-			ClusterctlConfigPath:    input.ClusterctlConfigPath,
-			InfrastructureProviders: input.E2EConfig.InfrastructureProviders(),
-			LogFolder:               filepath.Join(input.ArtifactFolder, "clusters", cluster.Name),
-		}, input.E2EConfig.GetIntervals(specName, "wait-controllers")...)
-
-		By("Ensure API servers are stable before doing move")
-		// Nb. This check was introduced to prevent doing move to self-hosted in an aggressive way and thus avoid flakes.
-		// More specifically, we were observing the test failing to get objects from the API server during move, so we
-		// are now testing the API servers are stable before starting move.
-		Consistently(func() error {
-			kubeSystem := &corev1.Namespace{}
-			return input.BootstrapClusterProxy.GetClient().Get(ctx, client.ObjectKey{Name: "kube-system"}, kubeSystem)
-		}, "5s", "100ms").Should(BeNil(), "Failed to assert bootstrap API server stability")
-		Consistently(func() error {
-			kubeSystem := &corev1.Namespace{}
-			return selfHostedClusterProxy.GetClient().Get(ctx, client.ObjectKey{Name: "kube-system"}, kubeSystem)
-		}, "5s", "100ms").Should(BeNil(), "Failed to assert self-hosted API server stability")
-
-		By("Moving the cluster to self hosted")
-		clusterctl.Move(ctx, clusterctl.MoveInput{
-			LogFolder:            filepath.Join(input.ArtifactFolder, "clusters", "bootstrap"),
-			ClusterctlConfigPath: input.ClusterctlConfigPath,
-			FromKubeconfigPath:   input.BootstrapClusterProxy.GetKubeconfigPath(),
-			ToKubeconfigPath:     selfHostedClusterProxy.GetKubeconfigPath(),
-			Namespace:            namespace.Name,
-		})
-
-		log.Logf("Waiting for the cluster to be reconciled after moving to self hosted")
-		selfHostedCluster = framework.DiscoveryAndWaitForCluster(ctx, framework.DiscoveryAndWaitForClusterInput{
-			Getter:    selfHostedClusterProxy.GetClient(),
-			Namespace: selfHostedNamespace.Name,
-			Name:      cluster.Name,
-		}, input.E2EConfig.GetIntervals(specName, "wait-cluster")...)
-
-		selfHostedControlPlane := framework.GetKubeadmControlPlaneByCluster(ctx, framework.GetKubeadmControlPlaneByClusterInput{
-			Lister:      selfHostedClusterProxy.GetClient(),
-			ClusterName: selfHostedCluster.Name,
-			Namespace:   selfHostedCluster.Namespace,
-		})
-		Expect(selfHostedControlPlane).ToNot(BeNil())
-
-		By("Upgrading the self hosted control-plane")
-		framework.UpgradeControlPlaneAndWaitForUpgrade(ctx, framework.UpgradeControlPlaneAndWaitForUpgradeInput{
-			ClusterProxy:                selfHostedClusterProxy,
-			Cluster:                     selfHostedCluster,
-			ControlPlane:                selfHostedControlPlane,
-			EtcdImageTag:                input.E2EConfig.GetVariable(EtcdVersionUpgradeTo),
-			DNSImageTag:                 input.E2EConfig.GetVariable(CoreDNSVersionUpgradeTo),
-			KubernetesUpgradeVersion:    input.E2EConfig.GetVariable(KubernetesVersionUpgradeTo),
-			WaitForMachinesToBeUpgraded: input.E2EConfig.GetIntervals(specName, "wait-machine-upgrade"),
-			WaitForDNSUpgrade:           input.E2EConfig.GetIntervals(specName, "wait-machine-upgrade"),
-			WaitForEtcdUpgrade:          input.E2EConfig.GetIntervals(specName, "wait-machine-upgrade"),
-		})
-
-		By("PASSED!")
+		var controlPlaneMachineCount int64 = 1
+		runPivotTest(controlPlaneMachineCount)
 	})
 
 	It("Should pivot the bootstrap cluster to a self-hosted HA cluster", func() {
-		By("Creating a workload cluster")
-
-		clusterctl.ApplyClusterTemplateAndWait(ctx, clusterctl.ApplyClusterTemplateAndWaitInput{
-			ClusterProxy: input.BootstrapClusterProxy,
-			ConfigCluster: clusterctl.ConfigClusterInput{
-				LogFolder:                filepath.Join(input.ArtifactFolder, "clusters", input.BootstrapClusterProxy.GetName()),
-				ClusterctlConfigPath:     input.ClusterctlConfigPath,
-				KubeconfigPath:           input.BootstrapClusterProxy.GetKubeconfigPath(),
-				InfrastructureProvider:   clusterctl.DefaultInfrastructureProvider,
-				Flavor:                   clusterctl.DefaultFlavor,
-				Namespace:                namespace.Name,
-				ClusterName:              fmt.Sprintf("%s-%s", specName, util.RandomString(6)),
-				KubernetesVersion:        input.E2EConfig.GetVariable(KubernetesVersion),
-				ControlPlaneMachineCount: pointer.Int64Ptr(3),
-				WorkerMachineCount:       pointer.Int64Ptr(1),
-			},
-			WaitForClusterIntervals:      input.E2EConfig.GetIntervals(specName, "wait-cluster"),
-			WaitForControlPlaneIntervals: input.E2EConfig.GetIntervals(specName, "wait-control-plane"),
-			WaitForMachineDeployments:    input.E2EConfig.GetIntervals(specName, "wait-worker-nodes"),
-		}, clusterResources)
-
-		By("Turning the workload cluster into a management cluster")
-
-		// In case of the cluster id a DockerCluster, we should load controller images into the nodes.
-		// Nb. this can be achieved also by changing the DockerMachine spec, but for the time being we are using
-		// this approach because this allows to have a single source of truth for images, the e2e config
-		cluster := clusterResources.Cluster
-		if cluster.Spec.InfrastructureRef.Kind == "DockerCluster" {
-			Expect(bootstrap.LoadImagesToKindCluster(ctx, bootstrap.LoadImagesToKindClusterInput{
-				Name:   cluster.Name,
-				Images: input.E2EConfig.Images,
-			})).To(Succeed())
-		}
-
-		// Get a ClusterBroker so we can interact with the workload cluster
-		selfHostedClusterProxy = input.BootstrapClusterProxy.GetWorkloadCluster(ctx, cluster.Namespace, cluster.Name)
-
-		Byf("Creating a namespace for hosting the %s test spec", specName)
-		selfHostedNamespace, selfHostedCancelWatches = framework.CreateNamespaceAndWatchEvents(ctx, framework.CreateNamespaceAndWatchEventsInput{
-			Creator:   selfHostedClusterProxy.GetClient(),
-			ClientSet: selfHostedClusterProxy.GetClientSet(),
-			Name:      namespace.Name,
-			LogFolder: filepath.Join(input.ArtifactFolder, "clusters", "bootstrap"),
-		})
-
-		By("Initializing the workload cluster")
-		clusterctl.InitManagementClusterAndWatchControllerLogs(ctx, clusterctl.InitManagementClusterAndWatchControllerLogsInput{
-			ClusterProxy:            selfHostedClusterProxy,
-			ClusterctlConfigPath:    input.ClusterctlConfigPath,
-			InfrastructureProviders: input.E2EConfig.InfrastructureProviders(),
-			LogFolder:               filepath.Join(input.ArtifactFolder, "clusters", cluster.Name),
-		}, input.E2EConfig.GetIntervals(specName, "wait-controllers")...)
-
-		By("Ensure API servers are stable before doing move")
-		// Nb. This check was introduced to prevent doing move to self-hosted in an aggressive way and thus avoid flakes.
-		// More specifically, we were observing the test failing to get objects from the API server during move, so we
-		// are now testing the API servers are stable before starting move.
-		Consistently(func() error {
-			kubeSystem := &corev1.Namespace{}
-			return input.BootstrapClusterProxy.GetClient().Get(ctx, client.ObjectKey{Name: "kube-system"}, kubeSystem)
-		}, "5s", "100ms").Should(BeNil(), "Failed to assert bootstrap API server stability")
-		Consistently(func() error {
-			kubeSystem := &corev1.Namespace{}
-			return selfHostedClusterProxy.GetClient().Get(ctx, client.ObjectKey{Name: "kube-system"}, kubeSystem)
-		}, "5s", "100ms").Should(BeNil(), "Failed to assert self-hosted API server stability")
-
-		By("Moving the cluster to self hosted")
-		clusterctl.Move(ctx, clusterctl.MoveInput{
-			LogFolder:            filepath.Join(input.ArtifactFolder, "clusters", "bootstrap"),
-			ClusterctlConfigPath: input.ClusterctlConfigPath,
-			FromKubeconfigPath:   input.BootstrapClusterProxy.GetKubeconfigPath(),
-			ToKubeconfigPath:     selfHostedClusterProxy.GetKubeconfigPath(),
-			Namespace:            namespace.Name,
-		})
-
-		log.Logf("Waiting for the cluster to be reconciled after moving to self hosted")
-		selfHostedCluster = framework.DiscoveryAndWaitForCluster(ctx, framework.DiscoveryAndWaitForClusterInput{
-			Getter:    selfHostedClusterProxy.GetClient(),
-			Namespace: selfHostedNamespace.Name,
-			Name:      cluster.Name,
-		}, input.E2EConfig.GetIntervals(specName, "wait-cluster")...)
-
-		selfHostedControlPlane := framework.GetKubeadmControlPlaneByCluster(ctx, framework.GetKubeadmControlPlaneByClusterInput{
-			Lister:      selfHostedClusterProxy.GetClient(),
-			ClusterName: selfHostedCluster.Name,
-			Namespace:   selfHostedCluster.Namespace,
-		})
-		Expect(selfHostedControlPlane).ToNot(BeNil())
-
-		By("Upgrading the self hosted control-plane")
-		framework.UpgradeControlPlaneAndWaitForUpgrade(ctx, framework.UpgradeControlPlaneAndWaitForUpgradeInput{
-			ClusterProxy:                selfHostedClusterProxy,
-			Cluster:                     selfHostedCluster,
-			ControlPlane:                selfHostedControlPlane,
-			EtcdImageTag:                input.E2EConfig.GetVariable(EtcdVersionUpgradeTo),
-			DNSImageTag:                 input.E2EConfig.GetVariable(CoreDNSVersionUpgradeTo),
-			KubernetesUpgradeVersion:    input.E2EConfig.GetVariable(KubernetesVersionUpgradeTo),
-			WaitForMachinesToBeUpgraded: input.E2EConfig.GetIntervals(specName, "wait-machine-upgrade"),
-			WaitForDNSUpgrade:           input.E2EConfig.GetIntervals(specName, "wait-machine-upgrade"),
-			WaitForEtcdUpgrade:          input.E2EConfig.GetIntervals(specName, "wait-machine-upgrade"),
-		})
-
-		By("PASSED!")
+		var controlPlaneMachineCount int64 = 3
+		runPivotTest(controlPlaneMachineCount)
 	})
 
 	AfterEach(func() {
